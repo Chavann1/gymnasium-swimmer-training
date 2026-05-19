@@ -1,0 +1,4 @@
+stable-baselines3>=2.0.0
+torch>=1.13
+gymnasium>=0.28
+# Mujoco is environment-specific; ensure you have mujoco and mujoco-py or mujoco-python installed as needed
