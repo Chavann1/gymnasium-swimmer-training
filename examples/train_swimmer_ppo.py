@@ -1,19 +1,19 @@
 """Train Swimmer-v5 with PPO (Stable-Baselines3 / PyTorch).
 
 Usage:
-  pip install -r examples/requirements-train.txt
-  python examples/train_swimmer_ppo.py --timesteps 200000
+    pip install -r examples/requirements-train.txt
+    python examples/train_swimmer_ppo.py --timesteps 2000000
 
-This script uses `SwimmerEnv.get_default_ppo_hyperparams()` for sensible defaults
-and a simple curriculum wrapper that increases `curriculum_level` every N episodes.
+This script uses `SwimmerEnv.get_default_ppo_hyperparams()` for sensible defaults,
+vectorized observation/reward normalization, and an optional curriculum wrapper.
 """
 import argparse
 import os
 import gymnasium as gym
-import numpy as np
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
 class CurriculumWrapper(gym.Wrapper):
@@ -27,6 +27,9 @@ class CurriculumWrapper(gym.Wrapper):
         self._first_reset = True
 
     def reset(self, **kwargs):
+        if self.curriculum_interval <= 0:
+            return super().reset(**kwargs)
+
         if self._first_reset:
             self._first_reset = False
         else:
@@ -56,11 +59,19 @@ def make_env(xml_file=None, curriculum_interval=50, max_level=5):
 
 
 def main(args):
-    env = make_env(xml_file=args.xml_file, curriculum_interval=args.curriculum_interval, max_level=args.max_level)
+    vec_env = DummyVecEnv(
+        [
+            lambda: make_env(
+                xml_file=args.xml_file,
+                curriculum_interval=args.curriculum_interval,
+                max_level=args.max_level,
+            )
+        ]
+    )
 
     # Pull default hyperparams from the environment
     try:
-        hp = env.unwrapped.get_default_ppo_hyperparams()
+        hp = vec_env.envs[0].unwrapped.get_default_ppo_hyperparams()
     except Exception:
         hp = {
             "learning_rate": 3e-4,
@@ -70,12 +81,20 @@ def main(args):
             "n_epochs": 10,
             "gamma": 0.99,
             "gae_lambda": 0.95,
-            "ent_coef": 0.0,
+            "ent_coef": 0.01,
         }
+
+    vec_env = VecNormalize(
+        vec_env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+        gamma=hp.get("gamma", 0.99),
+    )
 
     model = PPO(
         "MlpPolicy",
-        env,
+        vec_env,
         learning_rate=hp.get("learning_rate", 3e-4),
         clip_range=hp.get("clip_range", 0.2),
         n_steps=hp.get("n_steps", 2048),
@@ -83,7 +102,7 @@ def main(args):
         n_epochs=hp.get("n_epochs", 10),
         gamma=hp.get("gamma", 0.99),
         gae_lambda=hp.get("gae_lambda", 0.95),
-        ent_coef=hp.get("ent_coef", 0.0),
+        ent_coef=hp.get("ent_coef", 0.01),
         verbose=1,
     )
 
@@ -92,14 +111,15 @@ def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
     model_path = os.path.join(args.save_dir, "ppo_swimmer")
     model.save(model_path)
+    vec_env.save(f"{model_path}.vecnormalize.pkl")
     print(f"Model saved to {model_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps to train")
+    parser.add_argument("--timesteps", type=int, default=2000000, help="Total timesteps to train")
     parser.add_argument("--xml-file", dest="xml_file", default=None, help="Optional xml_file for Swimmer model")
-    parser.add_argument("--curriculum-interval", type=int, default=50, help="Episodes between curriculum increases")
+    parser.add_argument("--curriculum-interval", type=int, default=0, help="Episodes between curriculum increases; 0 disables curriculum")
     parser.add_argument("--max-level", type=int, default=5, help="Maximum curriculum level")
     parser.add_argument("--save-dir", default="models", help="Directory to save trained model")
     args = parser.parse_args()

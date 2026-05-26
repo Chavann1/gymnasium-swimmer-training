@@ -27,3 +27,4 @@ python examples/run_trained.py --model models/test_run/ppo_swimmer --render rgb_
 Notes
 - Ensure MuJoCo / OpenGL rendering backend is available if using `human` render mode. On headless servers prefer `rgb_array` + GIF/video recording.
 - The training example uses SB3 which relies on PyTorch; please refer to `examples/requirements-train.txt` for versions.
+- Swimmer usually needs on the order of millions of timesteps before the gait becomes obvious. The updated training script also saves VecNormalize statistics alongside the model so rollout uses the same observation scale.

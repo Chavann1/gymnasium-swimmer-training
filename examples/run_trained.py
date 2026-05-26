@@ -12,6 +12,7 @@ import os
 
 import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
 def main():
@@ -47,23 +48,30 @@ def main():
         except Exception:
             pass
 
-    obs, info = env.reset()
+    vec_env = DummyVecEnv([lambda: env])
+    vecnorm_path = f"{args.model}.vecnormalize.pkl"
+    if os.path.exists(vecnorm_path):
+        vec_env = VecNormalize.load(vecnorm_path, vec_env)
+        vec_env.training = False
+        vec_env.norm_reward = False
+
+    obs = vec_env.reset()
 
     frames = []
     for i in range(int(args.steps)):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
+        obs, reward, done, info = vec_env.step(action)
 
         if args.render == "human":
             # env renders automatically in human mode; sleep a bit for visibility
             time.sleep(0.01)
         else:
-            frame = env.render()
+            frame = vec_env.render()
             if frame is not None:
                 frames.append(frame)
 
-        if terminated or truncated:
-            obs, info = env.reset()
+        if bool(done[0]):
+            obs = vec_env.reset()
 
     if args.render == "human":
         print("\nRunning finished. Press Enter to close the window...")
@@ -72,7 +80,7 @@ def main():
         except Exception:
             pass
 
-    env.close()
+    vec_env.close()
 
 
 if __name__ == "__main__":
