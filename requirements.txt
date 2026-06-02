@@ -1,0 +1,5 @@
+gymnasium
+mujoco
+matplotlib
+numpy
+torch
