@@ -26,6 +26,11 @@ class GAConfig:
     episodes_per_candidate: int = 1
     base_episode_length: int = 200
     curriculum_growth: int = 25
+    forward_reward_weight: float = 3.0
+    distance_reward_weight: float = 2.0
+    energy_penalty_weight: float = 0.15
+    smoothness_penalty_weight: float = 0.05
+    stability_penalty_weight: float = 0.10
     render_best: bool = False
     seed: int | None = None
     output_dir: str = "artifacts"
@@ -47,6 +52,7 @@ class GenomeMLPController(nn.Module):
         self.network = nn.Sequential(*layers)
 
         self.genome_size = sum(parameter.numel() for parameter in self.parameters())
+        self._genome_loaded = False
 
     def random_genome(self, rng: np.random.Generator) -> np.ndarray:
         return rng.normal(0.0, 0.5, size=self.genome_size).astype(np.float32)
@@ -61,9 +67,11 @@ class GenomeMLPController(nn.Module):
                 )
                 parameter.copy_(values)
                 offset += size
+        self._genome_loaded = True
 
-    def act(self, genome: np.ndarray, observation: np.ndarray) -> np.ndarray:
-        self.load_genome(genome)
+    def act(self, observation: np.ndarray) -> np.ndarray:
+        if not self._genome_loaded:
+            raise RuntimeError("Genome not loaded. Call load_genome() before act().")
         observation_tensor = torch.as_tensor(observation, dtype=torch.float32)
         with torch.no_grad():
             action_tensor = torch.tanh(self.network(observation_tensor))
@@ -78,13 +86,29 @@ class EvaluationResult:
     instability_penalty: float
     oscillation_penalty: float
     episode_length: int
+    distance_travelled: float
 
 
 class SwimmerEvaluator:
-    def __init__(self, env_id: str, controller: GenomeMLPController, seed: int | None = None):
+    def __init__(
+        self,
+        env_id: str,
+        controller: GenomeMLPController,
+        seed: int | None = None,
+        forward_reward_weight: float = 3.0,
+        distance_reward_weight: float = 2.0,
+        energy_penalty_weight: float = 0.15,
+        smoothness_penalty_weight: float = 0.05,
+        stability_penalty_weight: float = 0.10,
+    ):
         self.env_id = env_id
         self.controller = controller
         self.seed = seed
+        self.forward_reward_weight = forward_reward_weight
+        self.distance_reward_weight = distance_reward_weight
+        self.energy_penalty_weight = energy_penalty_weight
+        self.smoothness_penalty_weight = smoothness_penalty_weight
+        self.stability_penalty_weight = stability_penalty_weight
 
     def _make_env(self, render_mode: str | None = None):
         return gym.make(self.env_id, render_mode=render_mode)
@@ -100,15 +124,18 @@ class SwimmerEvaluator:
         total_forward = 0.0
         total_energy = 0.0
         total_instability = 0.0
+        total_distance = 0.0
         total_oscillation = 0.0
         total_steps = 0
 
         env = self._make_env(render_mode="human" if render else None)
         try:
+            base_env = env.unwrapped
             for episode_index in range(episodes):
+                self.controller.load_genome(genome)
                 observation, _ = env.reset(seed=None if self.seed is None else self.seed + episode_index)
+                episode_start_x = float(base_env.data.qpos[0])
                 previous_action = np.zeros(env.action_space.shape, dtype=np.float32)
-                previous_velocity = np.zeros(2, dtype=np.float32)
 
                 episode_fitness = 0.0
                 episode_forward = 0.0
@@ -117,29 +144,27 @@ class SwimmerEvaluator:
                 episode_oscillation = 0.0
 
                 for _ in range(episode_length):
-                    action = self.controller.act(genome, observation)
+                    action = self.controller.act(observation)
                     action = np.clip(action, env.action_space.low, env.action_space.high)
 
                     next_observation, _, terminated, truncated, info = env.step(action)
 
                     forward_reward = float(info.get("reward_forward", 0.0))
                     control_penalty = float(-info.get("reward_ctrl", 0.0))
-                    action_delta = float(np.mean(np.abs(action - previous_action)))
-                    velocity_delta = float(abs(info.get("x_velocity", 0.0)) + abs(info.get("y_velocity", 0.0)) - np.sum(np.abs(previous_velocity)))
-                    velocity_delta = abs(velocity_delta)
+                    action_delta = float(np.mean(np.square(action - previous_action)))
+                    vertical_drift = float(abs(info.get("y_position", 0.0)) + 0.5 * abs(info.get("y_velocity", 0.0)))
 
                     episode_forward += forward_reward
                     episode_energy += control_penalty
-                    episode_instability += velocity_delta
+                    episode_instability += vertical_drift
                     episode_oscillation += action_delta
-
-                    episode_fitness += forward_reward
-                    episode_fitness -= 0.25 * control_penalty
-                    episode_fitness -= 0.05 * velocity_delta
-                    episode_fitness -= 0.02 * action_delta
+                    episode_fitness += self.forward_reward_weight * forward_reward
+                    episode_fitness += self.distance_reward_weight * forward_reward * base_env.dt
+                    episode_fitness -= self.energy_penalty_weight * control_penalty
+                    episode_fitness -= self.smoothness_penalty_weight * action_delta
+                    episode_fitness -= self.stability_penalty_weight * vertical_drift
 
                     previous_action = action
-                    previous_velocity = np.array([info.get("x_velocity", 0.0), info.get("y_velocity", 0.0)], dtype=np.float32)
                     observation = next_observation
                     total_steps += 1
 
@@ -148,11 +173,15 @@ class SwimmerEvaluator:
                     if terminated or truncated:
                         break
 
+                episode_distance = float(info["x_position"]) - episode_start_x
+                episode_fitness += self.distance_reward_weight * episode_distance
+
                 total_fitness += episode_fitness
                 total_forward += episode_forward
                 total_energy += episode_energy
                 total_instability += episode_instability
                 total_oscillation += episode_oscillation
+                total_distance += episode_distance
         finally:
             env.close()
 
@@ -164,6 +193,7 @@ class SwimmerEvaluator:
             instability_penalty=total_instability * scale,
             oscillation_penalty=total_oscillation * scale,
             episode_length=total_steps // max(episodes, 1),
+            distance_travelled=total_distance * scale,
         )
 
 
@@ -178,7 +208,16 @@ class GeneticAlgorithmTrainer:
         finally:
             probe_env.close()
         self.controller = GenomeMLPController(obs_dim, action_dim, config.hidden_sizes)
-        self.evaluator = SwimmerEvaluator(config.env_id, self.controller, seed=config.seed)
+        self.evaluator = SwimmerEvaluator(
+            config.env_id,
+            self.controller,
+            seed=config.seed,
+            forward_reward_weight=config.forward_reward_weight,
+            distance_reward_weight=config.distance_reward_weight,
+            energy_penalty_weight=config.energy_penalty_weight,
+            smoothness_penalty_weight=config.smoothness_penalty_weight,
+            stability_penalty_weight=config.stability_penalty_weight,
+        )
         self.population = [self.controller.random_genome(self.rng) for _ in range(config.population_size)]
         self.history = {
             "best_fitness": [],
@@ -187,6 +226,7 @@ class GeneticAlgorithmTrainer:
             "energy_penalty": [],
             "instability_penalty": [],
             "oscillation_penalty": [],
+            "distance_travelled": [],
         }
 
     def _episode_length_for_generation(self, generation: int) -> int:
@@ -261,6 +301,7 @@ class GeneticAlgorithmTrainer:
             self.history["energy_penalty"].append(generation_result.energy_penalty)
             self.history["instability_penalty"].append(generation_result.instability_penalty)
             self.history["oscillation_penalty"].append(generation_result.oscillation_penalty)
+            self.history["distance_travelled"].append(generation_result.distance_travelled)
 
             if generation_best > best_fitness:
                 best_fitness = generation_best
@@ -269,7 +310,8 @@ class GeneticAlgorithmTrainer:
 
             print(
                 f"generation {generation:03d} | best={generation_best:.3f} | avg={generation_mean:.3f} | "
-                f"forward={generation_result.forward_reward:.3f} | energy={generation_result.energy_penalty:.3f}"
+                f"forward={generation_result.forward_reward:.3f} | distance={generation_result.distance_travelled:.3f} | "
+                f"energy={generation_result.energy_penalty:.3f}"
             )
 
             if generation < self.config.generations - 1:
@@ -295,6 +337,7 @@ class GeneticAlgorithmTrainer:
         plt.plot(generations, self.history["best_fitness"], label="best fitness")
         plt.plot(generations, self.history["average_fitness"], label="average fitness")
         plt.plot(generations, self.history["forward_reward"], label="forward reward")
+        plt.plot(generations, self.history["distance_travelled"], label="distance travelled")
         plt.plot(generations, self.history["energy_penalty"], label="energy penalty")
         plt.xlabel("Generation")
         plt.ylabel("Score")
@@ -321,6 +364,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crossover-rate", type=float, default=0.9)
     parser.add_argument("--base-episode-length", type=int, default=200)
     parser.add_argument("--curriculum-growth", type=int, default=25)
+    parser.add_argument("--forward-reward-weight", type=float, default=3.0)
+    parser.add_argument("--distance-reward-weight", type=float, default=2.0)
+    parser.add_argument("--energy-penalty-weight", type=float, default=0.15)
+    parser.add_argument("--smoothness-penalty-weight", type=float, default=0.05)
+    parser.add_argument("--stability-penalty-weight", type=float, default=0.10)
     parser.add_argument("--episodes-per-candidate", type=int, default=1)
     parser.add_argument("--render-best", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
@@ -342,6 +390,11 @@ def main(argv: Iterable[str] | None = None) -> None:
         episodes_per_candidate=args.episodes_per_candidate,
         base_episode_length=args.base_episode_length,
         curriculum_growth=args.curriculum_growth,
+        forward_reward_weight=args.forward_reward_weight,
+        distance_reward_weight=args.distance_reward_weight,
+        energy_penalty_weight=args.energy_penalty_weight,
+        smoothness_penalty_weight=args.smoothness_penalty_weight,
+        stability_penalty_weight=args.stability_penalty_weight,
         render_best=args.render_best,
         seed=args.seed,
         output_dir=args.output_dir,

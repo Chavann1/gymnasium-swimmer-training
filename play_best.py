@@ -58,7 +58,7 @@ def main():
 
         obs, _ = env.reset()
         for step in range(args.steps):
-            action = controller.act(genome, obs)
+            action = controller.act(obs)
             obs, _, terminated, truncated, info = env.step(action)
             if args.render:
                 env.render()
